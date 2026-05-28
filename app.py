@@ -5,43 +5,31 @@ import cv2
 import base64
 import time
 import threading
+import warnings
+
+warnings.filterwarnings("ignore")
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ── New mediapipe API (0.10+) ──────────────────────────────────────────────────
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe import Image, ImageFormat
+import mediapipe as mp
 
-# ── Load ML models ─────────────────────────────────────────────────────────────
+mp_hands   = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands      = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.5
+)
+
 model         = joblib.load("knn_regressor_model.joblib")
 label_encoder = joblib.load("label_encoder.joblib")
 
 app = Flask(__name__)
 CORS(app)
 
-# ── Hand Landmarker setup (new API) ────────────────────────────────────────────
-import urllib.request, os
 
-MODEL_PATH = "hand_landmarker.task"
-MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-
-if not os.path.exists(MODEL_PATH):
-    print("Downloading hand_landmarker.task ...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Downloaded.")
-
-base_options    = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-hand_options    = mp_vision.HandLandmarkerOptions(
-    base_options=base_options,
-    num_hands=1,
-    min_hand_detection_confidence=0.6,
-    min_tracking_confidence=0.5
-)
-hand_landmarker = mp_vision.HandLandmarker.create_from_options(hand_options)
-
-# ── Wave Detector ──────────────────────────────────────────────────────────────
 class WaveDetector:
     HISTORY_SECONDS = 1.5
     MIN_CROSSINGS   = 3
@@ -50,7 +38,7 @@ class WaveDetector:
     def __init__(self):
         self.positions = []
 
-    def update(self, norm_x: float) -> str:
+    def update(self, norm_x):
         now = time.time()
         self.positions.append((now, norm_x))
         cutoff = now - self.HISTORY_SECONDS
@@ -83,26 +71,6 @@ _cooldown_until = 0.0
 _state_lock     = threading.Lock()
 
 
-# ── Helper: draw landmarks manually ───────────────────────────────────────────
-HAND_CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),
-    (0,5),(5,6),(6,7),(7,8),
-    (5,9),(9,10),(10,11),(11,12),
-    (9,13),(13,14),(14,15),(15,16),
-    (13,17),(17,18),(18,19),(19,20),
-    (0,17)
-]
-
-def draw_landmarks(frame, landmarks, h, w):
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (255, 255, 255), 2)
-    for pt in pts:
-        cv2.circle(frame, pt, 4, (0, 255, 0), -1)
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"message": "Rescue AI Gesture Detection API Running"})
@@ -129,52 +97,40 @@ def process_frame():
         if frame is None:
             return jsonify({"success": False, "error": "Could not decode frame"}), 400
 
-        frame = cv2.flip(frame, 1)
-        h, w  = frame.shape[:2]
+        frame   = cv2.flip(frame, 1)
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
 
-        # Convert BGR -> RGB for mediapipe
-        rgb        = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image   = Image(image_format=ImageFormat.SRGB, data=rgb)
-        result     = hand_landmarker.detect(mp_image)
-
-        gesture_label = "IDLE"
-        is_emergency  = False
-
-        if result.hand_landmarks:
-            landmarks = result.hand_landmarks[0]
-            draw_landmarks(frame, landmarks, h, w)
-
-            wrist_x  = landmarks[0].x
-            detected = wave_detector.update(wrist_x)
-
-            if detected in ("WAVE_LEFT", "WAVE_RIGHT"):
-                now = time.time()
-                with _state_lock:
-                    if now > _cooldown_until:
-                        gesture_label   = detected
-                        is_emergency    = True
-                        _cooldown_until = now + 3.0
-                    else:
-                        gesture_label = detected
-                        is_emergency  = False
-            else:
-                gesture_label = "IDLE"
-
-        # Annotate frame
-        colour = (0, 0, 255) if is_emergency else (0, 255, 0)
-        label  = "EMERGENCY!" if is_emergency else gesture_label
-        cv2.putText(frame, label, (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, colour, 3)
-
-        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        out_b64   = base64.b64encode(buffer).decode("utf-8")
-
-        # KNN prediction
-        predicted_gesture  = gesture_label
+        gesture_label      = "IDLE"
+        is_emergency       = False
+        predicted_gesture  = "IDLE"
         encoded_prediction = 0
 
-        if result.hand_landmarks:
-            lm              = result.hand_landmarks[0]
+        if results.multi_hand_landmarks:
+            for hand_lm in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(
+                    frame, hand_lm, mp_hands.HAND_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(0, 255, 0),     thickness=2, circle_radius=3),
+                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2)
+                )
+
+                wrist_x  = hand_lm.landmark[0].x
+                detected = wave_detector.update(wrist_x)
+
+                if detected in ("WAVE_LEFT", "WAVE_RIGHT"):
+                    now = time.time()
+                    with _state_lock:
+                        if now > _cooldown_until:
+                            gesture_label   = detected
+                            is_emergency    = True
+                            _cooldown_until = now + 3.0
+                        else:
+                            gesture_label = detected
+                            is_emergency  = False
+                else:
+                    gesture_label = "IDLE"
+
+            lm              = results.multi_hand_landmarks[0].landmark
             feature_indices = [0, 4, 8, 12, 16, 20]
             features        = [lm[i].x for i in feature_indices]
             input_df        = pd.DataFrame([features], columns=["ax","ay","az","gx","gy","gz"])
@@ -182,6 +138,13 @@ def process_frame():
             encoded_prediction = int(round(prediction[0]))
             encoded_prediction = max(0, min(encoded_prediction, len(label_encoder.classes_) - 1))
             predicted_gesture  = str(label_encoder.inverse_transform([encoded_prediction])[0])
+
+        colour = (0, 0, 255) if is_emergency else (0, 255, 0)
+        label  = "EMERGENCY!" if is_emergency else gesture_label
+        cv2.putText(frame, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, colour, 3)
+
+        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        out_b64   = base64.b64encode(buffer).decode("utf-8")
 
         return jsonify({
             "success":            True,
@@ -226,4 +189,6 @@ def predict():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
