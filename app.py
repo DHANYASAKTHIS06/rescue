@@ -5,63 +5,41 @@ import cv2
 import base64
 import time
 import threading
-import warnings
-import sys
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ── Bulletproof Headless MediaPipe Resolution ───────────────────────────────
-import mediapipe as mp
-
-# Force Python to inspect the underlying module namespaces directly
-try:
-    if hasattr(mp, 'solutions'):
-        mp_hands = mp.solutions.hands
-        mp_drawing = mp.solutions.drawing_utils
-    else:
-        # Direct dynamic injection if the top-level namespace is masked
-        import mediapipe.python.solutions.hands as mp_hands
-        import mediapipe.python.solutions.drawing_utils as mp_drawing
-except (AttributeError, ModuleNotFoundError, ImportError):
-    try:
-        # Fallback to sys module lookup tree mapping
-        mp_hands = sys.modules.get('mediapipe.solutions.hands') or mp.solutions.hands
-        mp_drawing = sys.modules.get('mediapipe.solutions.drawing_utils') or mp.solutions.drawing_utils
-    except Exception:
-        # Final emergency explicit absolute resolution
-        from mediapipe.tasks.python import vision
-        # If your package structure lacks old solutions, use an alias pointer wrapper
-        class MPFallback:
-            Hands = mp.tasks.vision.HandLandmarker if hasattr(mp, 'tasks') else None
-        print("Using alternate MediaPipe compilation configuration.")
-
-# Suppress scikit-learn version mismatch warnings in the Render logs
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+# ── New mediapipe API (0.10+) ──────────────────────────────────────────────────
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe import Image, ImageFormat
 
 # ── Load ML models ─────────────────────────────────────────────────────────────
-try:
-    model         = joblib.load("knn_regressor_model.joblib")
-    label_encoder = joblib.load("label_encoder.joblib")
-except Exception as e:
-    print(f"CRITICAL Warning during model loading: {e}")
-    model = None
-    label_encoder = None
+model         = joblib.load("knn_regressor_model.joblib")
+label_encoder = joblib.load("label_encoder.joblib")
 
 app = Flask(__name__)
 CORS(app)
 
-# ── MediaPipe Setup ───────────────────────────────────────────────────────────
-try:
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.5
-    )
-except Exception as e:
-    print(f"MediaPipe initialization warning: {e}. Attempting native fallback context...")
-    hands = None
+# ── Hand Landmarker setup (new API) ────────────────────────────────────────────
+import urllib.request, os
+
+MODEL_PATH = "hand_landmarker.task"
+MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+
+if not os.path.exists(MODEL_PATH):
+    print("Downloading hand_landmarker.task ...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("Downloaded.")
+
+base_options    = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+hand_options    = mp_vision.HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=1,
+    min_hand_detection_confidence=0.6,
+    min_tracking_confidence=0.5
+)
+hand_landmarker = mp_vision.HandLandmarker.create_from_options(hand_options)
 
 # ── Wave Detector ──────────────────────────────────────────────────────────────
 class WaveDetector:
@@ -70,7 +48,7 @@ class WaveDetector:
     CENTRE_DEADBAND = 0.08
 
     def __init__(self):
-        self.positions = []   # (timestamp, norm_x)
+        self.positions = []
 
     def update(self, norm_x: float) -> str:
         now = time.time()
@@ -88,7 +66,7 @@ class WaveDetector:
 
         crossings = sum(
             1 for i in range(1, len(xs))
-            if (above[i] != above[i - 1]) or (below[i] != below[i - 1])
+            if (above[i] != above[i-1]) or (below[i] != below[i-1])
         )
 
         if crossings >= self.MIN_CROSSINGS:
@@ -102,7 +80,26 @@ class WaveDetector:
 
 wave_detector   = WaveDetector()
 _cooldown_until = 0.0
-_state_lock      = threading.Lock()
+_state_lock     = threading.Lock()
+
+
+# ── Helper: draw landmarks manually ───────────────────────────────────────────
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),
+    (9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),
+    (0,17)
+]
+
+def draw_landmarks(frame, landmarks, h, w):
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (255, 255, 255), 2)
+    for pt in pts:
+        cv2.circle(frame, pt, 4, (0, 255, 0), -1)
+
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -113,11 +110,6 @@ def home():
 
 @app.route("/process-frame", methods=["POST"])
 def process_frame():
-    """
-    Receives a base64-encoded JPEG frame from the browser webcam,
-    runs MediaPipe hand detection + wave logic,
-    returns gesture state + annotated frame (base64 JPEG).
-    """
     global _cooldown_until
 
     try:
@@ -138,56 +130,37 @@ def process_frame():
             return jsonify({"success": False, "error": "Could not decode frame"}), 400
 
         frame = cv2.flip(frame, 1)
+        h, w  = frame.shape[:2]
+
+        # Convert BGR -> RGB for mediapipe
+        rgb        = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image   = Image(image_format=ImageFormat.SRGB, data=rgb)
+        result     = hand_landmarker.detect(mp_image)
 
         gesture_label = "IDLE"
         is_emergency  = False
-        predicted_gesture = "IDLE"
-        encoded_prediction = 0
 
-        # Run pipeline safely only if MediaPipe compilation loaded successfully
-        if hands is not None:
-            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+        if result.hand_landmarks:
+            landmarks = result.hand_landmarks[0]
+            draw_landmarks(frame, landmarks, h, w)
 
-            if results.multi_hand_landmarks:
-                for hand_lm in results.multi_hand_landmarks:
-                    try:
-                        mp_drawing.draw_landmarks(
-                            frame, hand_lm, mp_hands.HAND_CONNECTIONS,
-                            mp_drawing.DrawingSpec(color=(0, 255, 0),    thickness=2, circle_radius=3),
-                            mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2)
-                        )
-                    except Exception:
-                        pass # Secure pipeline execution even if rendering helpers encounter drawing issues
+            wrist_x  = landmarks[0].x
+            detected = wave_detector.update(wrist_x)
 
-                    wrist_x  = hand_lm.landmark[0].x
-                    detected = wave_detector.update(wrist_x)
-
-                    if detected in ("WAVE_LEFT", "WAVE_RIGHT"):
-                        now = time.time()
-                        with _state_lock:
-                            if now > _cooldown_until:
-                                gesture_label   = detected
-                                is_emergency    = True
-                                _cooldown_until = now + 3.0
-                            else:
-                                gesture_label = detected
-                                is_emergency  = False
+            if detected in ("WAVE_LEFT", "WAVE_RIGHT"):
+                now = time.time()
+                with _state_lock:
+                    if now > _cooldown_until:
+                        gesture_label   = detected
+                        is_emergency    = True
+                        _cooldown_until = now + 3.0
                     else:
-                        gesture_label = "IDLE"
+                        gesture_label = detected
+                        is_emergency  = False
+            else:
+                gesture_label = "IDLE"
 
-                # KNN calculation via landmarks
-                if model is not None and label_encoder is not None:
-                    lm              = results.multi_hand_landmarks[0].landmark
-                    feature_indices = [0, 4, 8, 12, 16, 20]
-                    features        = [lm[i].x for i in feature_indices]
-                    input_df        = pd.DataFrame([features], columns=["ax","ay","az","gx","gy","gz"])
-                    prediction      = model.predict(input_df)
-                    encoded_prediction = int(round(prediction[0]))
-                    encoded_prediction = max(0, min(encoded_prediction, len(label_encoder.classes_) - 1))
-                    predicted_gesture  = label_encoder.inverse_transform([encoded_prediction])[0]
-
-        # Annotate processed output frame
+        # Annotate frame
         colour = (0, 0, 255) if is_emergency else (0, 255, 0)
         label  = "EMERGENCY!" if is_emergency else gesture_label
         cv2.putText(frame, label, (20, 50),
@@ -196,12 +169,26 @@ def process_frame():
         _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         out_b64   = base64.b64encode(buffer).decode("utf-8")
 
+        # KNN prediction
+        predicted_gesture  = gesture_label
+        encoded_prediction = 0
+
+        if result.hand_landmarks:
+            lm              = result.hand_landmarks[0]
+            feature_indices = [0, 4, 8, 12, 16, 20]
+            features        = [lm[i].x for i in feature_indices]
+            input_df        = pd.DataFrame([features], columns=["ax","ay","az","gx","gy","gz"])
+            prediction      = model.predict(input_df)
+            encoded_prediction = int(round(prediction[0]))
+            encoded_prediction = max(0, min(encoded_prediction, len(label_encoder.classes_) - 1))
+            predicted_gesture  = str(label_encoder.inverse_transform([encoded_prediction])[0])
+
         return jsonify({
             "success":            True,
             "gesture":            gesture_label,
             "emergency":          is_emergency,
-            "predicted_gesture":  str(predicted_gesture),
-            "encoded_prediction": int(encoded_prediction),
+            "predicted_gesture":  predicted_gesture,
+            "encoded_prediction": encoded_prediction,
             "annotated_frame":    out_b64
         })
 
@@ -211,10 +198,6 @@ def process_frame():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Legacy endpoint — manual sensor input still supported."""
-    if model is None or label_encoder is None:
-        return jsonify({"success": False, "error": "ML Model failed to load on server boot."}), 500
-
     try:
         data     = request.get_json()
         required = ["ax", "ay", "az", "gx", "gy", "gz"]
@@ -227,16 +210,15 @@ def predict():
             [[float(data[f]) for f in required]],
             columns=required
         )
-
         prediction         = model.predict(input_df)
         encoded_prediction = int(round(prediction[0]))
         encoded_prediction = max(0, min(encoded_prediction, len(label_encoder.classes_) - 1))
-        predicted_gesture  = label_encoder.inverse_transform([encoded_prediction])[0]
+        predicted_gesture  = str(label_encoder.inverse_transform([encoded_prediction])[0])
 
         return jsonify({
             "success":            True,
-            "predicted_gesture":  str(predicted_gesture),
-            "encoded_prediction": int(encoded_prediction)
+            "predicted_gesture":  predicted_gesture,
+            "encoded_prediction": encoded_prediction
         })
 
     except Exception as e:
@@ -244,6 +226,4 @@ def predict():
 
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)
