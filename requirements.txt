@@ -6,4 +6,4 @@ scikit-learn
 joblib
 gunicorn
 opencv-python-headless
-mediapipe-headless
+mediapipe
