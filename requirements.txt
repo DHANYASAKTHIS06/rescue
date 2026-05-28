@@ -2,8 +2,8 @@ flask
 flask-cors
 pandas
 numpy
-scikit-learn
+scikit-learn==1.6.1
 joblib
 gunicorn
 opencv-python-headless
-mediapipe
+mediapipe==0.9.3.0
