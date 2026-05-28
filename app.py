@@ -2,25 +2,36 @@ import joblib
 import pandas as pd
 import numpy as np
 import cv2
-import mediapipe as mp
 import base64
 import time
 import threading
+import warnings
+
+# Explicitly import the submodules to bypass the AttributeError on headless hosts
+import mediapipe as mp
+from mediapipe.python.solutions import hands as mp_hands
+from mediapipe.python.solutions import drawing_utils as mp_drawing
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# Suppress version mismatch warnings in production logs if desired
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
 # ── Load ML models ─────────────────────────────────────────────────────────────
-model         = joblib.load("knn_regressor_model.joblib")
-label_encoder = joblib.load("label_encoder.joblib")
+try:
+    model         = joblib.load("knn_regressor_model.joblib")
+    label_encoder = joblib.load("label_encoder.joblib")
+except Exception as e:
+    print(f"CRITICAL Warning during model loading: {e}")
+    model = None
+    label_encoder = None
 
 app = Flask(__name__)
 CORS(app)
 
 # ── MediaPipe ──────────────────────────────────────────────────────────────────
-mp_hands   = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands      = mp_hands.Hands(
+hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,
     min_detection_confidence=0.6,
@@ -66,7 +77,7 @@ class WaveDetector:
 
 wave_detector   = WaveDetector()
 _cooldown_until = 0.0
-_state_lock     = threading.Lock()
+_state_lock      = threading.Lock()
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -149,7 +160,7 @@ def process_frame():
         predicted_gesture  = gesture_label
         encoded_prediction = 0
 
-        if results.multi_hand_landmarks:
+        if results.multi_hand_landmarks and model is not None and label_encoder is not None:
             lm              = results.multi_hand_landmarks[0].landmark
             feature_indices = [0, 4, 8, 12, 16, 20]
             features        = [lm[i].x for i in feature_indices]
@@ -175,6 +186,9 @@ def process_frame():
 @app.route("/predict", methods=["POST"])
 def predict():
     """Legacy endpoint — manual sensor input still supported."""
+    if model is None or label_encoder is None:
+        return jsonify({"success": False, "error": "ML Model failed to load on server boot."}), 500
+
     try:
         data     = request.get_json()
         required = ["ax", "ay", "az", "gx", "gy", "gz"]
@@ -204,4 +218,7 @@ def predict():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # Render binds dynamic port assignments to the PORT environment variable
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
