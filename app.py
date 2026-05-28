@@ -14,27 +14,14 @@ from flask_cors import CORS
 # ── Bulletproof Headless MediaPipe Resolution ───────────────────────────────
 import mediapipe as mp
 
-# Force Python to inspect the underlying module namespaces directly
 try:
-    if hasattr(mp, 'solutions'):
-        mp_hands = mp.solutions.hands
-        mp_drawing = mp.solutions.drawing_utils
-    else:
-        # Direct dynamic injection if the top-level namespace is masked
-        import mediapipe.python.solutions.hands as mp_hands
-        import mediapipe.python.solutions.drawing_utils as mp_drawing
-except (AttributeError, ModuleNotFoundError, ImportError):
-    try:
-        # Fallback to sys module lookup tree mapping
-        mp_hands = sys.modules.get('mediapipe.solutions.hands') or mp.solutions.hands
-        mp_drawing = sys.modules.get('mediapipe.solutions.drawing_utils') or mp.solutions.drawing_utils
-    except Exception:
-        # Final emergency explicit absolute resolution
-        from mediapipe.tasks.python import vision
-        # If your package structure lacks old solutions, use an alias pointer wrapper
-        class MPFallback:
-            Hands = mp.tasks.vision.HandLandmarker if hasattr(mp, 'tasks') else None
-        print("Using alternate MediaPipe compilation configuration.")
+    # Standard cloud/headless path
+    from mediapipe.solutions import hands as mp_hands
+    from mediapipe.solutions import drawing_utils as mp_drawing
+except ImportError:
+    # Alternative local fallback path
+    import mediapipe.python.solutions.hands as mp_hands
+    import mediapipe.python.solutions.drawing_utils as mp_drawing
 
 # Suppress scikit-learn version mismatch warnings in the Render logs
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -56,18 +43,19 @@ try:
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
-        min_detection_confidence=0.6,
+        min_detection_confidence=0.5, # Slightly lowered to catch moving hands easier
         min_tracking_confidence=0.5
     )
 except Exception as e:
-    print(f"MediaPipe initialization warning: {e}. Attempting native fallback context...")
+    print(f"MediaPipe initialization warning: {e}")
     hands = None
 
 # ── Wave Detector ──────────────────────────────────────────────────────────────
 class WaveDetector:
-    HISTORY_SECONDS = 1.5
-    MIN_CROSSINGS   = 3
-    CENTRE_DEADBAND = 0.08
+    # Optimized parameters to handle slower web/network frame rates over HTTP
+    HISTORY_SECONDS = 3.0  
+    MIN_CROSSINGS   = 2    
+    CENTRE_DEADBAND = 0.06 
 
     def __init__(self):
         self.positions = []   # (timestamp, norm_x)
@@ -78,7 +66,7 @@ class WaveDetector:
         cutoff = now - self.HISTORY_SECONDS
         self.positions = [(t, x) for t, x in self.positions if t >= cutoff]
 
-        if len(self.positions) < 4:
+        if len(self.positions) < 3:
             return "IDLE"
 
         xs     = [x for _, x in self.positions]
@@ -137,6 +125,7 @@ def process_frame():
         if frame is None:
             return jsonify({"success": False, "error": "Could not decode frame"}), 400
 
+        # Mirror frame for intuitive orientation alignment
         frame = cv2.flip(frame, 1)
 
         gesture_label = "IDLE"
@@ -144,7 +133,6 @@ def process_frame():
         predicted_gesture = "IDLE"
         encoded_prediction = 0
 
-        # Run pipeline safely only if MediaPipe compilation loaded successfully
         if hands is not None:
             rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb)
@@ -158,8 +146,9 @@ def process_frame():
                             mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2)
                         )
                     except Exception:
-                        pass # Secure pipeline execution even if rendering helpers encounter drawing issues
+                        pass 
 
+                    # Extract wrist horizontal tracking metrics
                     wrist_x  = hand_lm.landmark[0].x
                     detected = wave_detector.update(wrist_x)
 
@@ -176,7 +165,7 @@ def process_frame():
                     else:
                         gesture_label = "IDLE"
 
-                # KNN calculation via landmarks
+                # KNN calculation via landmarks (Isolated to prevent variable overwrites)
                 if model is not None and label_encoder is not None:
                     lm              = results.multi_hand_landmarks[0].landmark
                     feature_indices = [0, 4, 8, 12, 16, 20]
@@ -198,9 +187,9 @@ def process_frame():
 
         return jsonify({
             "success":            True,
-            "gesture":            gesture_label,
+            "gesture":            gesture_label,      # Heuristic wave status
             "emergency":          is_emergency,
-            "predicted_gesture":  str(predicted_gesture),
+            "predicted_gesture":  str(predicted_gesture), # ML static prediction status
             "encoded_prediction": int(encoded_prediction),
             "annotated_frame":    out_b64
         })
