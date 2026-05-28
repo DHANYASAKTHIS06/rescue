@@ -7,15 +7,19 @@ import time
 import threading
 import warnings
 
-# Explicitly import the submodules to bypass the AttributeError on headless hosts
+# ── Safe MediaPipe Imports ────────────────────────────────────────────────────
 import mediapipe as mp
-from mediapipe.python.solutions import hands as mp_hands
-from mediapipe.python.solutions import drawing_utils as mp_drawing
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+# Bypasses environment namespace bugs on headless cloud systems gracefully
+try:
+    import mediapipe.python.solutions.hands as mp_hands
+    import mediapipe.python.solutions.drawing_utils as mp_drawing
+except ModuleNotFoundError:
+    # Fallback to alternative top-level paths depending on package structure
+    from mediapipe.solutions import hands as mp_hands
+    from mediapipe.solutions import drawing_utils as mp_drawing
 
-# Suppress version mismatch warnings in production logs if desired
+# Suppress unpickling/version mismatch warnings in console logs
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # ── Load ML models ─────────────────────────────────────────────────────────────
@@ -23,14 +27,14 @@ try:
     model         = joblib.load("knn_regressor_model.joblib")
     label_encoder = joblib.load("label_encoder.joblib")
 except Exception as e:
-    print(f"CRITICAL Warning during model loading: {e}")
+    print(f"CRITICAL: Model failed to load: {e}")
     model = None
     label_encoder = None
 
 app = Flask(__name__)
 CORS(app)
 
-# ── MediaPipe ──────────────────────────────────────────────────────────────────
+# ── MediaPipe Configuration ───────────────────────────────────────────────────
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,
@@ -218,7 +222,7 @@ def predict():
 
 
 if __name__ == "__main__":
-    # Render binds dynamic port assignments to the PORT environment variable
+    # Render binds your web services via dynamic runtime variables.
     import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
