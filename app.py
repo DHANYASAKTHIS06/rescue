@@ -236,24 +236,38 @@ def process_frame():
 @app.route("/process-audio", methods=["POST"])
 def process_audio():
     """
-    Receives a base64-encoded WAV audio clip from the browser mic.
-    Transcribes using Google Speech Recognition (free, no API key needed).
-    Checks transcript against hidden keywords.
-    Returns emergency flag if keyword found.
+    Gracefully processes incoming speech data checks.
+    Supports plain text payloads from Web Speech engines OR base64 audio fallback chunks, 
+    and returns an emergency flag when hidden keywords match.
     """
     try:
-        data      = request.get_json(force=True)
-        b64_audio = data.get("audio", "")
+        data = request.get_json(force=True)
+        
+        # Check 1: If frontend is passing plain string text via Web Speech API
+        if "text" in data:
+            transcript = data.get("text", "").lower().strip()
+            matched_keyword = check_hidden_keywords(transcript)
+            is_emergency = matched_keyword is not None
 
+            return jsonify({
+                "success": True,
+                "transcript": transcript,
+                "emergency": is_emergency,
+                "keyword": matched_keyword,
+                "source": "speech"
+            })
+
+        # Check 2: Fallback baseline for processing base64 raw container chunks
+        b64_audio = data.get("audio", "")
         if not b64_audio:
-            return jsonify({"success": False, "error": "No audio provided"}), 400
+            return jsonify({"success": False, "error": "No recognizable text or audio data fields found in request."}), 400
 
         if "," in b64_audio:
             b64_audio = b64_audio.split(",", 1)[1]
 
         audio_bytes = base64.b64decode(b64_audio)
 
-        # Write to a temp WAV file for SpeechRecognition
+        # Write data to a temporary file for decoding
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
@@ -261,7 +275,6 @@ def process_audio():
         try:
             with sr.AudioFile(tmp_path) as source:
                 audio_data = recognizer.record(source)
-
             transcript = recognizer.recognize_google(audio_data).lower()
         except sr.UnknownValueError:
             transcript = ""
@@ -271,7 +284,7 @@ def process_audio():
                 "transcript": "",
                 "emergency":  False,
                 "keyword":    None,
-                "error":      f"Speech service error: {e}"
+                "error":      f"Speech recognition fallback service fault: {e}"
             })
         finally:
             try:
