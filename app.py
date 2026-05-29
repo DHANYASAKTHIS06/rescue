@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-import speech_recognition as sr
+import SpeechRecognition as sr
 
 # ── ML Models ──────────────────────────────────────────────────────────────────
 try:
